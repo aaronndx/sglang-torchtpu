@@ -21,7 +21,6 @@ from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
-import triton
 from safetensors.torch import load_file
 from transformers.utils import cached_file
 
@@ -346,6 +345,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        assert self.num_v_heads % self.attn_tp_size == 0, (
+            f"linear_num_value_heads ({self.num_v_heads}) must be divisible by "
+            f"attn_tp_size ({self.attn_tp_size})."
+        )
+        assert (
+            self.num_k_heads % self.attn_tp_size == 0
+            or self.attn_tp_size % self.num_k_heads == 0
+        ), (
+            f"linear_num_key_heads ({self.num_k_heads}) and attn_tp_size "
+            f"({self.attn_tp_size}) must divide one another."
+        )
+        self.qk_rep = (
+            self.attn_tp_size // self.num_k_heads
+            if self.attn_tp_size > self.num_k_heads
+            else 1
+        )
+        self.local_num_k_heads = (self.num_k_heads * self.qk_rep) // self.attn_tp_size
+        self.local_num_v_heads = self.num_v_heads // self.attn_tp_size
+        self.local_key_dim = self.local_num_k_heads * self.head_k_dim
+        self.replicated_key_dim = self.key_dim * self.qk_rep
         self.alt_stream = alt_stream
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
@@ -355,7 +374,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.layer_norm_epsilon = config.rms_norm_eps
 
         # Conv1d layer
-        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv_dim = self.replicated_key_dim * 2 + self.value_dim
         self.conv1d = ColumnParallelLinear(
             input_size=self.conv_kernel_size,
             output_size=self.conv_dim,
@@ -370,13 +389,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # projection of the input hidden states
         self.in_proj_qkvz = self.create_qkvz_proj(
             hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
+            key_dim=self.replicated_key_dim,
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
+        if self.qk_rep > 1:
+            self.in_proj_qkvz._checkpoint_output_sizes = [
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+                self.value_dim,
+            ]
+            self.in_proj_qkvz._shard_tp_reps = (self.qk_rep, self.qk_rep, 1, 1)
 
         self.in_proj_ba = self.create_ba_proj(
             hidden_size=self.hidden_size,
@@ -417,7 +444,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         # Conv1d weight loader setup
-        query_key_settings = (self.key_dim, 0, False)
+        query_key_settings = (
+            self.replicated_key_dim,
+            self.replicated_key_dim - self.key_dim,
+            self.qk_rep > 1,
+        )
         value_settings = (self.value_dim, 0, False)
 
         self._override_weight_loader(
@@ -435,10 +466,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # State parameters
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.attn_tp_size),
+            torch.ones(self.local_num_v_heads),
         )
         self.A_log = nn.Parameter(
-            torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+            torch.empty(self.local_num_v_heads, dtype=torch.float32),
         )
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
@@ -449,9 +480,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
-            num_q_heads=self.num_k_heads // self.attn_tp_size,
-            num_k_heads=self.num_k_heads // self.attn_tp_size,
-            num_v_heads=self.num_v_heads // self.attn_tp_size,
+            num_q_heads=self.local_num_k_heads,
+            num_k_heads=self.local_num_k_heads,
+            num_v_heads=self.local_num_v_heads,
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
@@ -536,12 +567,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     @staticmethod
     def _get_split_sizes_for_param(module, param, loaded_shard_id):
         """Return checkpoint-side split sizes for this param type."""
+        checkpoint_sizes = getattr(
+            module, "_checkpoint_output_sizes", module.output_sizes
+        )
         if isinstance(param, BlockQuantScaleParameter):
             # Split by output blocks, not raw output sizes.
             block_n, _ = module.quant_method.quant_config.weight_block_size
             block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
             return [
-                (module.output_sizes[idx] + block_n - 1) // block_n
+                (checkpoint_sizes[idx] + block_n - 1) // block_n
                 for idx in loaded_shard_id
             ]
 
@@ -550,19 +584,43 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return [1 for _ in loaded_shard_id]
 
         # Normal weight / non-block quant tensor
-        return [module.output_sizes[idx] for idx in loaded_shard_id]
+        return [checkpoint_sizes[idx] for idx in loaded_shard_id]
 
     @classmethod
     def _make_packed_weight_loader(cls, module, original_weight_loader):
         """Wrap the param's original loader so split checkpoints:
           - in_proj_qkv + in_proj_z -> merged in_proj_qkvz
           - in_proj_b + in_proj_a   -> merged in_proj_ba
-        can load correctly for both normal and FP8 params.
+        can load correctly for both normal and FP8 params, including replicated
+        Q/K shards when ``attn_tp_size > linear_num_key_heads``.
         """
 
+        def _call_single_shard(param, chunk, shard_id):
+            shard_tp_reps = getattr(module, "_shard_tp_reps", None)
+            rep = (
+                shard_tp_reps[shard_id]
+                if shard_tp_reps is not None and isinstance(shard_id, int)
+                else 1
+            )
+            if rep > 1 and not getattr(module, "use_presharded_weights", False):
+                orig_tp_rank = module.tp_rank
+                module.tp_rank = orig_tp_rank // rep
+                try:
+                    return original_weight_loader(param, chunk, shard_id)
+                finally:
+                    module.tp_rank = orig_tp_rank
+            return original_weight_loader(param, chunk, shard_id)
+
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
-            # Only intercept split-checkpoint tuple shards.
-            # int shard_id and None should preserve original behavior.
+            if (
+                loaded_shard_id is None
+                and hasattr(module, "_checkpoint_output_sizes")
+                and not getattr(module, "use_presharded_weights", False)
+            ):
+                loaded_shard_id = tuple(range(len(module.output_sizes)))
+
+            # Intercept split-checkpoint tuple shards (and fused-in-checkpoint
+            # qkvz when Q/K shards are replicated across TP ranks).
             if isinstance(loaded_shard_id, tuple):
                 split_sizes = cls._get_split_sizes_for_param(
                     module, param, loaded_shard_id
@@ -595,11 +653,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
                 for idx, chunk in zip(loaded_shard_id, chunks):
-                    # Delegate each chunk to the param's original int-shard loader.
-                    original_weight_loader(param, chunk, idx)
+                    _call_single_shard(param, chunk, idx)
                 return
 
-            return original_weight_loader(param, loaded_weight, loaded_shard_id)
+            return _call_single_shard(param, loaded_weight, loaded_shard_id)
 
         return weight_loader
 
@@ -653,9 +710,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
-        k_tp = self.key_dim // self.attn_tp_size
+        k_tp = self.local_key_dim
         v_tp = self.value_dim // self.attn_tp_size
-        nv_tp = self.num_v_heads // self.attn_tp_size
+        nv_tp = self.local_num_v_heads
 
         # Directly split, no head group reshape
         query, key, value, z = mixed_qkvz.split([k_tp, k_tp, v_tp, v_tp], dim=-1)
@@ -982,7 +1039,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and isinstance(projected_states_ba, torch.Tensor)
         )
         use_fused_contiguous_unpack = (
-            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            self.local_num_v_heads // self.local_num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
         if use_fused_decode_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
@@ -993,12 +1050,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a = projected_states_ba
         # TPU has no Triton; fall through to the pure-torch split below.
         elif use_fused_contiguous_unpack and not _is_tpu:
-            if _is_cpu:
-                num_k_heads_tp = self.num_k_heads // self.attn_tp_size
-                num_v_heads_tp = self.num_v_heads // self.attn_tp_size
-            else:
-                num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
-                num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            num_k_heads_tp = self.local_num_k_heads
+            num_v_heads_tp = self.local_num_v_heads
             use_strided_prefill_z = (
                 _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
             )
