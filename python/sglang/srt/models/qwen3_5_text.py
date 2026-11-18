@@ -167,7 +167,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if self.is_mrope_enabled:
+        if self.is_mrope_enabled and forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
 
         hidden_states = self.model(
@@ -197,9 +197,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         # across model processes can exceed host memory before GPU copies finish.
         def body_weights():
             for name, loaded_weight in weights:
-                if name.startswith(_MODEL_PREFIX):
-                    yield name[len(_MODEL_PREFIX) :], loaded_weight
-                elif name == "lm_head.weight":
+                if name.startswith(("model.visual.", "visual.", "mtp.", "model.mtp.")):
+                    continue
+                if name.startswith("model.language_model."):
+                    name = _MODEL_PREFIX + name[len("model.language_model.") :]
+                elif name.startswith("language_model."):
+                    name = name[len("language_model.") :]
+                if name in ("lm_head.weight", "model.lm_head.weight"):
                     if self.config.tie_word_embeddings:
                         continue
                     if "lm_head.weight" not in params_dict:
@@ -210,6 +214,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add("lm_head.weight")
+                elif name.startswith(_MODEL_PREFIX):
+                    yield name[len(_MODEL_PREFIX) :], loaded_weight
 
         body_loaded = self.model.load_weights(body_weights())
         loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)
