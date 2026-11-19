@@ -99,6 +99,7 @@ from sglang_tpu.hooks.scheduler import initialize_dense_moe_config
 from sglang_tpu.hooks.spec_tp_sync import broadcast_undeferred
 from sglang_tpu.hooks.spec_worker import select_experimental_spec_worker
 from sglang_tpu.hooks.swa_miss_metrics import hook_specs as swa_miss_metrics_hooks
+from sglang_tpu.hooks.true_on_policy import hook_specs as true_on_policy_hooks
 from sglang_tpu.hooks.twolevel_allreduce import all_reduce as twolevel_all_reduce
 from sglang_tpu.hooks.twolevel_allreduce import (
     merged_moe_all_reduce as twolevel_merged_moe_all_reduce,
@@ -458,6 +459,8 @@ HOOKS.extend(hook_specs())
 HOOKS.extend(padded_logits_sampling_hooks())
 
 HOOKS.extend(logprob_grid_hooks())
+
+HOOKS.extend(true_on_policy_hooks())
 # After dsv4_hooks: the V4.1 pool hooks must be the outer wrapper.
 HOOKS.extend(dsv41_hooks())
 
